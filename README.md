@@ -7,7 +7,7 @@
 * Python3.6/3.7/3.8
 * Pytorch1.10
 * pycocotools(Linux:`pip install pycocotools`; Windows:`pip install pycocotools-windows`
-* Ubuntu或Centos(Not recommended for Windows)
+* Ubuntu or Centos(Not recommended for Windows)
 * Best trained using GPU
 * `requirements.txt` for detailed environment configuration.
 
