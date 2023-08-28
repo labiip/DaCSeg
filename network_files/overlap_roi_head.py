@@ -10,6 +10,7 @@ from torchvision.ops import roi_align
 
 from . import det_utils
 from . import boxes as box_ops
+from .con_net import build_reconstruction_head, mask_recon_loss, mask_recon_inference
 
 
 class FocalLoss(nn.Module):
@@ -427,8 +428,87 @@ def overlap_cls_loss(overlap_cls_logits, proposals, gt_overlaps, mask_matched_id
     cls_labels = cls_labels.to(device=torch.device("cuda"if torch.cuda.is_available() else 'cpu'))
 
     overlap_loss = F.cross_entropy(overlap_cls_logits, cls_labels)
+    loss_dict.update(overlap_loss)
 
-    return overlap_loss
+    # stride: 64,32,16,8,4 -> 4, 8, 16, 32
+    fpn_fms = fpn_fms[1:][::-1]
+    stride = [4, 8, 16, 32]
+    pool_features, rcnn_rois, labels, bbox_targets = roi_pool(
+        fpn_fms, rcnn_rois, stride, (7, 7), 'roi_align',
+        labels, bbox_targets)
+    flatten_feature = F.flatten(pool_features, start_axis=1)
+    roi_feature = F.relu(self.fc1(flatten_feature))
+    roi_feature = F.relu(self.fc2(roi_feature))
+    pred_emd_pred_cls_0 = self.emd_pred_cls_0(roi_feature)
+    pred_emd_pred_delta_0 = self.emd_pred_delta_0(roi_feature)
+    pred_emd_pred_cls_1 = self.emd_pred_cls_1(roi_feature)
+    pred_emd_pred_delta_1 = self.emd_pred_delta_1(roi_feature)
+    if self.training:
+        loss0 = emd_loss(
+            pred_emd_pred_delta_0, pred_emd_pred_cls_0,
+            pred_emd_pred_delta_1, pred_emd_pred_cls_1,
+            bbox_targets, labels)
+        loss1 = emd_loss(
+            pred_emd_pred_delta_1, pred_emd_pred_cls_1,
+            pred_emd_pred_delta_0, pred_emd_pred_cls_0,
+            bbox_targets, labels)
+        loss = F.concat([loss0, loss1], axis=1)
+        indices = F.argmin(loss, axis=1)
+        loss_emd = F.indexing_one_hot(loss, indices, 1)
+        loss_emd = loss_emd.sum() / loss_emd.shapeof()[0]
+        loss_dict = {}
+        loss_dict['loss_rcnn_emd'] = loss_emd
+        return loss_dict
+    else:
+        pred_scores_0 = F.softmax(pred_emd_pred_cls_0)[:, 1:].reshape(-1, 1)
+        pred_scores_1 = F.softmax(pred_emd_pred_cls_1)[:, 1:].reshape(-1, 1)
+        pred_delta_0 = pred_emd_pred_delta_0[:, 4:].reshape(-1, 4)
+        pred_delta_1 = pred_emd_pred_delta_1[:, 4:].reshape(-1, 4)
+        target_shape = (rcnn_rois.shapeof()[0], config.num_classes - 1, 4)
+        base_rois = F.add_axis(rcnn_rois[:, 1:5], 1).broadcast(target_shape).reshape(-1, 4)
+        pred_bbox_0 = restore_bbox(base_rois, pred_delta_0, True)
+        pred_bbox_1 = restore_bbox(base_rois, pred_delta_1, True)
+        pred_bbox_0 = F.concat([pred_bbox_0, pred_scores_0], axis=1)
+        pred_bbox_1 = F.concat([pred_bbox_1, pred_scores_1], axis=1)
+        # [{head0, pre1, tag1}, {head1, pre1, tag1}, {head0, pre1, tag2}, ...]
+        pred_bbox = F.concat((pred_bbox_0, pred_bbox_1), axis=1).reshape(-1, 5)
+        return pred_bbox
+    #
+    # return overlap_loss
+
+
+
+def emd_loss(p_b0, p_c0, p_b1, p_c1, targets, labels):
+    pred_box = F.concat([p_b0, p_b1], axis=1).reshape(-1, p_b0.shapeof()[-1])
+    pred_box = pred_box.reshape(-1, config.num_classes, 4)
+    pred_score = F.concat([p_c0, p_c1], axis=1).reshape(-1, p_c0.shapeof()[-1])
+    targets = targets.reshape(-1, 4)
+    labels = labels.reshape(-1).astype(np.int32)
+    fg_masks = F.greater(labels, 0)
+    non_ignore_masks = F.greater_equal(labels, 0)
+    # mulitple class to one
+    indexing_label = (labels * fg_masks).reshape(-1,1)
+    indexing_label = indexing_label.broadcast((labels.shapeof()[0], 4))
+    pred_box = F.indexing_one_hot(pred_box, indexing_label, 1)
+    # loss for regression
+    loss_box_reg = smooth_l1_loss(
+        pred_box,
+        targets,
+        config.rcnn_smooth_l1_beta)
+    # loss for classification
+    loss_cls = softmax_loss(pred_score, labels)
+    loss = loss_cls*non_ignore_masks + loss_box_reg * fg_masks
+    loss = loss.reshape(-1, 2).sum(axis=1)
+    return loss.reshape(-1, 1)
+
+def restore_bbox(rois, deltas, unnormalize=True):
+    if unnormalize:
+        std_opr = mge.tensor(config.bbox_normalize_stds[None, :])
+        mean_opr = mge.tensor(config.bbox_normalize_means[None, :])
+        deltas = deltas * std_opr
+        deltas = deltas + mean_opr
+    pred_bbox = bbox_transform_inv_opr(rois, deltas)
+    return pred_bbox
 
 
 
@@ -835,6 +915,14 @@ class OverlapRoIHeads(torch.nn.Module):
                 gt_masks = [t["masks"] for t in targets]
                 gt_labels = [t["labels"] for t in targets]
                 gt_overlaps = [t["overlaps"] for t in targets]
+
+                if not os.path.exists("{}_codebook.npy".format(dataset_name)):
+                    if not self.SPRef:
+                        loss_recon = 0
+                        for i in range(len(mask_logits)):
+                            loss_recon += mask_recon_loss(mask_logits[i][0], proposals, self.recon_net, self.targets,
+                                                          mask_ths=self.recon_mask_ths, iter=self.iter)
+                        loss_mask.update({"loss_recon": loss_recon / len(mask_logits)})
 
                 rcnn_loss_mask = maskrcnn_loss(mask_logits, mask_proposals, gt_masks, gt_labels, pos_matched_idxs)
                 loss_mask = {"loss_mask":rcnn_loss_mask}
